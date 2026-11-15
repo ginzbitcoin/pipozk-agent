@@ -1,0 +1,6 @@
+.env
+*secret*
+node_modules/
+*.log
+decisions.jsonl
+test-decisions.jsonl
