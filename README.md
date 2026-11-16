@@ -183,12 +183,15 @@ Variabel env tambahan: `DECISIONS_FILE` (path file jejak, default
 
 ## Batasan MVP
 
-- `proof` dan `public_signals` selalu null: pembuktian Groth16
-  (Circom 2.x, snarkjs, artefak `gatekeeper.wasm` dan
-  `gatekeeper_final.zkey`) belum dibangun. Per /build, bukti yang
-  dihilangkan atau tidak valid dikenai -2 per task. Jadi MVP ini
-  bisa lolos preflight dan menjawab decide, tapi skor per task
-  kemungkinan terpotong 2 poin sampai proof dibangun.
+- `proof` dan `public_signals` diisi proof Groth16 lokal (snarkjs
+  0.7.6, artefak resmi `gatekeeper.wasm` dan
+  `gatekeeper_final.zkey`, 13 sinyal publik) untuk reason_code yang
+  bisa dibuktikan circuit (OK, VK_SUBSTITUTION, RECIPIENT_MISMATCH,
+  AMOUNT_EXCEEDS_LIMIT, INSUFFICIENT_BALANCE, EXPIRED). Bila proving
+  gagal atau reason_code tidak bisa dibuktikan (INVALID_INPUT,
+  TASK_EXPIRED, PROOF_REUSED, INTERNAL_ERROR), respons tetap
+  dikirim tanpa proof (fallback, rugi -2) daripada timeout.
+  Flag env PROOF_ENABLED=0 mengembalikan perilaku lama (proof null).
 - `proof_tx` hanya menggemakan pointer dari tugas masuk, bukan bukti
   submisi on-chain.
 - Tidak ada verifikasi on-chain (tidak ada panggilan jaringan keluar):
@@ -201,11 +204,10 @@ Variabel env tambahan: `DECISIONS_FILE` (path file jejak, default
   endpoint harus selalu di belakang HTTPS dan tidak diekspos langsung
   tanpa reverse proxy atau tunnel.
 
-Langkah lanjut sesudah MVP: unduh artefak circuit dari
-`/api/circuit-info` (vkHash Gatekeeper
-`0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0`),
-bangun proof Groth16 lokal dengan snarkjs, lalu submit ke zkVerify
-lewat Kurier dan tunggu Finalized sebelum mengembalikan `proof_tx`.
+Langkah lanjut: submit proof ke zkVerify lewat Kurier (opsional,
+butuh API key mainnet) bila suatu saat ingin mengembalikan
+`proof_tx` sebagai referensi on-chain Finalized; jalur respons
+saat ini sudah memakai proof lokal dan tidak membutuhkan Kurier.
 
 ## Cara tes
 

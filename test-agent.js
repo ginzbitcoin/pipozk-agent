@@ -15,6 +15,9 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const path = require('path');
 
+// Modul prover yang sama dipakai agent.js (untuk verifikasi proof lokal).
+const PROVER = require('./proof/prove-local.cjs');
+
 const TEST_PORT = 18741;
 const TEST_SECRET = 'test-secret-pipozk-jangan-dipakai-di-produksi';
 const TRAIL_FILE = path.join(__dirname, 'test-decisions.jsonl');
@@ -22,6 +25,10 @@ const BASE = `http://127.0.0.1:${TEST_PORT}`;
 
 let passed = 0;
 let failed = 0;
+
+// Respons pertama gk_test_01 (untuk uji replay identik + restart).
+let approveRaw01 = null;
+let approveProof01 = null;
 
 function check(name, condition, detail) {
   if (condition) {
@@ -76,6 +83,18 @@ function postSigned(pathName, obj, secretOverride) {
   const headers = {};
   if (sig) headers['x-agent-games-signature'] = sig;
   return request('POST', pathName, bodyString, headers);
+}
+
+// Verifikasi proof respons secara lokal terhadap verification key.
+// True bila proof ada, 13 sinyal publik, dan terverifikasi snarkjs.
+async function proofVerifies(json) {
+  if (!json || typeof json.proof !== 'object' || !json.proof) return false;
+  if (!Array.isArray(json.public_signals) || json.public_signals.length !== 13) return false;
+  try {
+    return await PROVER.verifyProof(json.proof, json.public_signals);
+  } catch (e) {
+    return false;
+  }
 }
 
 function validInput(overrides) {
@@ -148,61 +167,88 @@ async function runTests() {
     r.status === 401 && r.json && r.json.error === 'invalid_signature',
     `status=${r.status} body=${r.raw}`);
 
-  // 5. Decide valid -> APPROVE, proof null, signature valid.
+  // 5. Decide valid -> APPROVE + proof Groth16 terverifikasi, signature valid.
   r = await postSigned('/agent', validTask('gk_test_01'));
+  approveRaw01 = r.raw;
+  approveProof01 = r.json && r.json.proof;
   check('decide valid -> APPROVE',
     r.status === 200 && r.json && r.json.decision === 'APPROVE' && r.json.reason_code === 'OK',
     `status=${r.status} body=${r.raw}`);
-  check('decide valid -> proof null, public_signals null, proof_tx digemakan',
-    r.json && r.json.proof === null && r.json.public_signals === null
+  check('decide valid -> proof ada, 13 sinyal publik, proof_tx digemakan',
+    r.json && typeof r.json.proof === 'object' && r.json.proof !== null
+    && Array.isArray(r.json.public_signals) && r.json.public_signals.length === 13
     && typeof r.json.proof_tx === 'string' && r.json.proof_tx.startsWith('0xa8b3'),
-    `body=${r.raw}`);
+    `body=${r.raw.slice(0, 300)}`);
+  check('decide valid -> proof terverifikasi lokal (snarkjs)',
+    await proofVerifies(r.json),
+    'proof tidak terverifikasi');
   check('decide valid signature respons valid',
     verifyResponseSignature(r.raw, r.headers['x-agent-games-signature']),
     'signature tidak cocok');
 
-  // 6. VK substitution -> REJECT VK_SUBSTITUTION.
+  // 6. VK substitution -> REJECT VK_SUBSTITUTION + proof terverifikasi.
   r = await postSigned('/agent', validTask('gk_test_02', { proof_vk: '0x13aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }));
   check('decide VK beda -> REJECT VK_SUBSTITUTION',
     r.status === 200 && r.json && r.json.decision === 'REJECT' && r.json.reason_code === 'VK_SUBSTITUTION',
     `status=${r.status} body=${r.raw}`);
+  check('decide VK beda -> proof terverifikasi lokal',
+    await proofVerifies(r.json),
+    'proof tidak terverifikasi');
 
-  // 7. Penerima beda -> REJECT RECIPIENT_MISMATCH.
+  // 7. Penerima beda -> REJECT RECIPIENT_MISMATCH + proof terverifikasi.
   r = await postSigned('/agent', validTask('gk_test_03', { condition_recipient: '0x9999999999999999999999999999999999999999' }));
   check('decide penerima beda -> REJECT RECIPIENT_MISMATCH',
     r.status === 200 && r.json && r.json.decision === 'REJECT' && r.json.reason_code === 'RECIPIENT_MISMATCH',
     `status=${r.status} body=${r.raw}`);
+  check('decide penerima beda -> proof terverifikasi lokal',
+    await proofVerifies(r.json),
+    'proof tidak terverifikasi');
 
-  // 8. Jumlah melebihi batas -> REJECT AMOUNT_EXCEEDS_LIMIT.
+  // 8. Jumlah melebihi batas -> REJECT AMOUNT_EXCEEDS_LIMIT + proof terverifikasi.
   r = await postSigned('/agent', validTask('gk_test_04', { amount: '1500' }));
   check('decide amount > max -> REJECT AMOUNT_EXCEEDS_LIMIT',
     r.status === 200 && r.json && r.json.decision === 'REJECT' && r.json.reason_code === 'AMOUNT_EXCEEDS_LIMIT',
     `status=${r.status} body=${r.raw}`);
+  check('decide amount > max -> proof terverifikasi lokal',
+    await proofVerifies(r.json),
+    'proof tidak terverifikasi');
 
-  // 9. Saldo di bawah minimum -> REJECT INSUFFICIENT_BALANCE.
+  // 9. Saldo di bawah minimum -> REJECT INSUFFICIENT_BALANCE + proof terverifikasi.
   r = await postSigned('/agent', validTask('gk_test_05', { public_balance: '500' }));
   check('decide saldo < minimum -> REJECT INSUFFICIENT_BALANCE',
     r.status === 200 && r.json && r.json.decision === 'REJECT' && r.json.reason_code === 'INSUFFICIENT_BALANCE',
     `status=${r.status} body=${r.raw}`);
+  check('decide saldo < minimum -> proof terverifikasi lokal',
+    await proofVerifies(r.json),
+    'proof tidak terverifikasi');
 
-  // 10. Blok kedaluwarsa -> REJECT EXPIRED.
+  // 10. Blok kedaluwarsa -> REJECT EXPIRED + proof terverifikasi.
   r = await postSigned('/agent', validTask('gk_test_06', { current_block: 8430000 }));
   check('decide blok kedaluwarsa -> REJECT EXPIRED',
     r.status === 200 && r.json && r.json.decision === 'REJECT' && r.json.reason_code === 'EXPIRED',
     `status=${r.status} body=${r.raw}`);
+  check('decide blok kedaluwarsa -> proof terverifikasi lokal',
+    await proofVerifies(r.json),
+    'proof tidak terverifikasi');
 
-  // 11a. Proof dipakai ulang di task lain -> REJECT PROOF_REUSED.
+  // 11a. Proof dipakai ulang di task lain -> REJECT PROOF_REUSED tanpa proof.
   // proof_tx sama dengan tes 5 (gk_test_01), task_id berbeda.
   r = await postSigned('/agent', validTask('gk_test_07'));
   check('decide proof dipakai ulang -> REJECT PROOF_REUSED',
     r.status === 200 && r.json && r.json.decision === 'REJECT' && r.json.reason_code === 'PROOF_REUSED',
     `status=${r.status} body=${r.raw}`);
+  check('decide proof dipakai ulang -> tanpa proof (PROOF_REUSED tidak dibuktikan)',
+    r.json && r.json.proof === null && r.json.public_signals === null,
+    `body=${r.raw.slice(0, 200)}`);
 
   // 11b. Kiriman ulang task_id yang sama -> jawaban identik (APPROVE), bukan reuse.
   r = await postSigned('/agent', validTask('gk_test_01'));
   check('retry task_id sama -> APPROVE lagi (idempotent)',
     r.status === 200 && r.json && r.json.decision === 'APPROVE' && r.json.reason_code === 'OK',
     `status=${r.status} body=${r.raw}`);
+  check('retry task_id sama -> respons identik byte-per-byte (proof sama)',
+    r.raw === approveRaw01,
+    'respons replay berbeda dari respons pertama');
 
   // 12. Type tidak dikenal -> 400 unknown_task.
   r = await postSigned('/agent', { type: 'agent-games.apa-ini.v9', task_id: 'gk_test_08' });
@@ -252,6 +298,10 @@ async function runTrailTests() {
     first && Array.isArray(first.checks) && first.checks.length === 9
     && first.checks.every((c) => c.result === 'pass'),
     `checks=${JSON.stringify(first && first.checks)}`);
+  check('trail entri pertama menyimpan proof + 13 sinyal publik',
+    first && typeof first.proof === 'object' && first.proof !== null
+    && Array.isArray(first.public_signals) && first.public_signals.length === 13,
+    `proof=${first && JSON.stringify(first.proof).slice(0, 80)}`);
 
   r = await request('GET', '/agent/decisions/3', null, {});
   check('trail entri 3 REJECT RECIPIENT_MISMATCH, cek 1-2 pass, 3 fail, sisanya skipped',
@@ -311,6 +361,9 @@ async function runRestartTests() {
   check('restart retry task_id sama -> APPROVE lagi (idempotent)',
     r.status === 200 && r.json && r.json.decision === 'APPROVE' && r.json.reason_code === 'OK',
     `status=${r.status} body=${r.raw}`);
+  check('restart retry task_id sama -> proof SAMA seperti sebelum restart',
+    r.json && JSON.stringify(r.json.proof) === JSON.stringify(approveProof01),
+    'proof sesudah restart berbeda');
 
   // Keputusan baru di fase restart tercatat, kiriman ulang tidak.
   r = await request('GET', '/agent/decisions', null, {});
@@ -327,14 +380,38 @@ async function runRestartTests() {
   return failed === 0;
 }
 
-function startServer() {
+async function runNoProofTests() {
+  // Fase PROOF_ENABLED=0: perilaku lama (proof null), semua keputusan sama.
+  let r = await request('GET', '/health', null, {});
+  check('PROOF_ENABLED=0 health proofReady false',
+    r.status === 200 && r.json && r.json.ok === true && r.json.proofReady === false,
+    `body=${r.raw.slice(0, 200)}`);
+
+  // proof_tx baru supaya tidak kena PROOF_REUSED dari fase sebelumnya.
+  r = await postSigned('/agent', validTask('gk_test_11', { proof_tx: '0xc1d2e3f408192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091c' }));
+  check('PROOF_ENABLED=0 decide valid -> APPROVE tanpa proof',
+    r.status === 200 && r.json && r.json.decision === 'APPROVE' && r.json.reason_code === 'OK'
+    && r.json.proof === null && r.json.public_signals === null,
+    `status=${r.status} body=${r.raw.slice(0, 200)}`);
+
+  r = await postSigned('/agent', validTask('gk_test_12', { amount: '1500', proof_tx: '0xc2d3e4f508192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091d' }));
+  check('PROOF_ENABLED=0 jebakan amount -> REJECT tanpa proof',
+    r.status === 200 && r.json && r.json.decision === 'REJECT' && r.json.reason_code === 'AMOUNT_EXCEEDS_LIMIT'
+    && r.json.proof === null && r.json.public_signals === null,
+    `status=${r.status} body=${r.raw.slice(0, 200)}`);
+
+  console.log(`\nHasil no-proof: ${passed} lolos, ${failed} gagal.`);
+  return failed === 0;
+}
+
+function startServer(extraEnv) {
   const child = spawn(process.execPath, [path.join(__dirname, 'agent.js')], {
     env: Object.assign({}, process.env, {
       PORT: String(TEST_PORT),
       HOST: '127.0.0.1',
       AGENT_GAMES_HMAC_SECRET: TEST_SECRET,
       DECISIONS_FILE: TRAIL_FILE,
-    }),
+    }, extraEnv || {}),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stdout.on('data', (d) => process.stdout.write(`[server] ${d}`));
@@ -374,6 +451,22 @@ async function main() {
       ok = await runRestartTests();
     } catch (err) {
       console.log(`FAIL error saat tes restart: ${err.message}`);
+    }
+    child.kill();
+  }
+
+  if (ok) {
+    child = startServer({ PROOF_ENABLED: '0' });
+    ready = await waitForHealth(25);
+    if (!ready) {
+      console.log('FAIL server PROOF_ENABLED=0 tidak siap dalam 5 detik');
+      child.kill();
+      process.exit(1);
+    }
+    try {
+      ok = await runNoProofTests();
+    } catch (err) {
+      console.log(`FAIL error saat tes no-proof: ${err.message}`);
     }
     child.kill();
   }

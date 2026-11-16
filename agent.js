@@ -41,6 +41,49 @@ const HOST = process.env.HOST || '127.0.0.1';
 const MAX_BODY_BYTES = 1024 * 1024; // 1 MB, tugas platform jauh lebih kecil
 
 /* ------------------------------------------------------------------ */
+/* Prover Groth16 (proof lokal, opsional)                             */
+/* ------------------------------------------------------------------ */
+/*
+ * Proof Groth16 lokal untuk respons Gatekeeper (circuit resmi
+ * gatekeeper.wasm + gatekeeper_final.zkey, snarkjs). Bila modul
+ * tidak bisa dimuat (folder proof/ tidak ada / snarkjs belum
+ * terpasang), server tetap jalan seperti sebelumnya dengan proof
+ * null, bukan crash. Flag env PROOF_ENABLED=0 mematikan proving
+ * tanpa ubah kode.
+ */
+
+let PROVER = null;
+try {
+  PROVER = require('./proof/prove-local.cjs');
+} catch (err) {
+  console.error('[pipozk] prover tidak dimuat, proof tetap null: ' + err.message);
+}
+const PROOF_ENABLED = (process.env.PROOF_ENABLED || '1').trim() !== '0';
+
+// reason_code yang circuit-nya bisa buktikan (lima cek di dalam
+// circuit). INVALID_INPUT, TASK_EXPIRED, PROOF_REUSED, dan
+// INTERNAL_ERROR tidak bisa dibuktikan circuit (tidak mengenal
+// deadline_at, pemakaian ulang proof_tx, atau input rusak), jadi
+// tetap dijawab tanpa proof.
+const NEEDS_PROOF = {
+  OK: true,
+  VK_SUBSTITUTION: true,
+  RECIPIENT_MISMATCH: true,
+  AMOUNT_EXCEEDS_LIMIT: true,
+  INSUFFICIENT_BALANCE: true,
+  EXPIRED: true,
+};
+
+// Status self-test proving saat startup (async, tidak memblokir listen).
+const proofStatus = {
+  loaded: PROVER !== null,
+  enabled: PROOF_ENABLED,
+  selfTest: (PROVER && PROOF_ENABLED) ? 'pending' : 'skipped',
+  proofMs: null,
+  error: null,
+};
+
+/* ------------------------------------------------------------------ */
 /* Secret                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -330,6 +373,8 @@ function buildEntry(seq, prevHash, fields) {
     reason_code: fields.reasonCode,
     checks: deriveChecks(fields.reasonCode),
     proof_tx: fields.proofTx,
+    proof: fields.proof || null,
+    public_signals: fields.publicSignals || null,
     input: fields.input,
     input_hash: sha256Hex(canonicalJson(fields.input)),
     issued_at: fields.issuedAt || null,
@@ -403,8 +448,8 @@ function loadTrail() {
       taskCache.set(entry.task_id, {
         decision: entry.decision,
         reason_code: entry.reason_code,
-        proof: null,
-        public_signals: null,
+        proof: entry.proof || null,
+        public_signals: entry.public_signals || null,
         proof_tx: entry.proof_tx,
       });
     }
@@ -466,7 +511,7 @@ function sendJson(res, statusCode, obj, sign) {
   res.end(body);
 }
 
-function handleTask(body, res) {
+async function handleTask(body, res) {
   // Preflight: jawab { ok: true, protocolVersion: "v1" } bertanda tangan.
   if (body.type === 'agent-games.preflight.v1') {
     const out = { ok: true, protocolVersion: 'v1' };
@@ -511,18 +556,50 @@ function handleTask(body, res) {
     verdict = { decision: 'REJECT', reason_code: 'INTERNAL_ERROR' };
   }
 
-  // MVP: proof Groth16 belum dibangun, jadi proof dan public_signals
-  // null dan proof_tx hanya menggemakan pointer dari tugas masuk.
-  // Bukti yang dihilangkan atau tidak valid dikenai -2 per /build.
   const input = (envelope.input && typeof envelope.input === 'object') ? envelope.input : {};
   const proofTx = (typeof input.proof_tx === 'string' && input.proof_tx.trim())
     ? input.proof_tx.trim()
     : null;
+
+  // Proof Groth16 lokal (bila reason_code bisa dibuktikan circuit).
+  // Gagal proving TIDAK PERNAH mengubah keputusan: jawab keputusan
+  // yang benar tanpa proof (rugi -2) daripada timeout (juga -2, tapi
+  // berisiko kehilangan tugas). proof_tx tetap menggemakan pointer
+  // dari tugas masuk.
+  let proof = null;
+  let publicSignals = null;
+  if (PROVER && PROOF_ENABLED && NEEDS_PROOF[verdict.reason_code]) {
+    try {
+      const circuitInput = PROVER.buildCircuitInput(
+        {
+          task_id: taskId,
+          registered_vk: input.registered_vk,
+          proof_vk: input.proof_vk,
+          minimum: input.minimum,
+          public_balance: input.public_balance,
+          expiry_block: input.expiry_block,
+          current_block: input.current_block,
+          recipient: input.recipient,
+          condition_recipient: input.condition_recipient,
+          amount: input.amount,
+          max_transfer: input.max_transfer,
+        },
+        verdict.decision,
+      );
+      const r = await PROVER.generateProof(circuitInput);
+      proof = r.proof;
+      publicSignals = r.publicSignals;
+      log({ kind: 'prove', task_id: taskId, proof_ms: r.proofMs });
+    } catch (err) {
+      log({ kind: 'prove', task_id: taskId, result: 'failed', error: err.message });
+    }
+  }
+
   const out = {
     decision: verdict.decision,
     reason_code: verdict.reason_code,
-    proof: null,
-    public_signals: null,
+    proof,
+    public_signals: publicSignals,
     proof_tx: proofTx,
   };
 
@@ -537,6 +614,8 @@ function handleTask(body, res) {
     decision: out.decision,
     reasonCode: out.reason_code,
     proofTx,
+    proof: out.proof,
+    publicSignals: out.public_signals,
     input,
     issuedAt: (typeof envelope.issued_at === 'string') ? envelope.issued_at : null,
   });
@@ -620,7 +699,11 @@ const server = http.createServer((req, res) => {
 
   // Monitoring lokal, tanpa signature.
   if (req.method === 'GET' && urlPath === '/health') {
-    sendJson(res, 200, { ok: true }, false);
+    sendJson(res, 200, {
+      ok: true,
+      proofReady: PROVER !== null && PROOF_ENABLED && proofStatus.selfTest === 'ok',
+      proofSelfTest: proofStatus,
+    }, false);
     return;
   }
 
@@ -683,7 +766,12 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    handleTask(body, res);
+    handleTask(body, res).catch((err) => {
+      log({ kind: 'task', result: 'handler_error', error: err.message });
+      try {
+        if (!res.headersSent) sendJson(res, 500, { ok: false, error: 'internal' }, false);
+      } catch (e) { /* soket sudah tutup */ }
+    });
   });
   req.on('error', () => {
     try { sendJson(res, 400, { ok: false, error: 'bad_request' }, false); } catch (e) { /* soket sudah tutup */ }
@@ -691,6 +779,22 @@ const server = http.createServer((req, res) => {
 });
 
 loadTrail();
+
+// Self-test proving sekali saat startup (async, tidak memblokir listen).
+// Gagal self-test tidak menghentikan server: proof per tugas tetap
+// dicoba, dan bila proving memang rusak tiap tugas jatuh ke fallback
+// tanpa proof.
+if (PROVER && PROOF_ENABLED) {
+  PROVER.selfTest().then((r) => {
+    proofStatus.selfTest = 'ok';
+    proofStatus.proofMs = r.proofMs;
+    log({ kind: 'prove', result: 'selftest_ok', proof_ms: r.proofMs });
+  }).catch((err) => {
+    proofStatus.selfTest = 'failed';
+    proofStatus.error = err.message;
+    console.error('[pipozk] self-test proving GAGAL: ' + err.message);
+  });
+}
 
 server.listen(PORT, HOST, () => {
   console.log(`[pipozk] PipoZK jalan di http://${HOST}:${PORT} (secret fingerprint: ${SECRET_FINGERPRINT})`);
